@@ -1,0 +1,10 @@
+# 一期依赖（桌面软件 + 纯色抠图，零 AI 依赖）
+# 安装：pip install -r requirements-base.txt
+Pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.9
+
+# 注：若后续接入 GUI（M2），追加：
+# PySide6>=6.6
+# 打包（M4）追加：
+# pyinstaller>=6.0

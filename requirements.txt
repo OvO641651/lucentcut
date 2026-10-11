@@ -1,0 +1,20 @@
+# LucentCut 完整依赖
+# 安装：pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 说明（2026-10-11 调整）：AI 语义分割已改为自包含实现（直接用 onnxruntime 跑
+# 本地 u2netp.onnx），不再依赖 rembg，因此不再需要 rembg / pooch / pymatting /
+# scipy / scikit-image 这一整条链，安装更轻、打包更稳。
+
+# —— 核心 ——
+Pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.9
+
+# —— GUI ——
+PySide6>=6.6
+
+# —— AI 语义分割（本地离线，自实现 u2netp 推理）——
+onnxruntime>=1.16
+
+# —— 打包 ——
+pyinstaller>=6.0

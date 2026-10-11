@@ -1,0 +1,36 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+
+# ---------- 打包 / 构建产物 ----------
+build/
+dist/
+*.spec.bak
+
+# ---------- 应用内部数据（WorkBuddy 本地记忆等，非项目内容） ----------
+.workbuddy/
+
+# ---------- IDE ----------
+.idea/
+.vscode/
+
+# ---------- 模型权重（通过 tools/download_models.py 下载，不入仓） ----------
+src/models/models/
+
+# ---------- 运行 / 调试生成物 ----------
+output/
+image/compare_output/
+image/m13_debug/
+image/output/
+
+# ---------- 系统 ----------
+Thumbs.db
+.DS_Store
