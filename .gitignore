@@ -30,6 +30,7 @@ output/
 image/compare_output/
 image/m13_debug/
 image/output/
+image/*_nobg*.png
 
 # ---------- 系统 ----------
 Thumbs.db

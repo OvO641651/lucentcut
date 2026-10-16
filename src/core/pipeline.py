@@ -86,11 +86,20 @@ def process_array(
     keep_mask: Optional[np.ndarray] = None,   # 人工裁决：必须保留
     drop_mask: Optional[np.ndarray] = None,   # 人工裁决：必须去除
     override_feather: int = 1,                # 裁决层边界羽化像素
+    roi_mask: Optional[np.ndarray] = None,    # ROI：只在此区域内用新结果
+    base_rgb: Optional[np.ndarray] = None,    # ROI 外的底板 RGB（上一次结果）
+    base_alpha: Optional[np.ndarray] = None,  # ROI 外的底板 alpha（上一次结果）
+    roi_feather: int = 2,                     # ROI 边界羽化像素（防硬接缝）
 ) -> Tuple[np.ndarray, np.ndarray, str, float, bool, List[str]]:
-    """处理一张图（含人工裁决层叠加）。
+    """处理一张图（含人工裁决层叠加、可选 ROI 局部处理）。
 
     返回 (rgb_out, alpha_out, used_mode, rescued_ratio, reused, warnings)。
     人工裁决层在此处统一叠加，因此"再点一次开始处理"不会丢失用户修改。
+
+    ROI（M15 新增）：给定 roi_mask 与上一次结果 (base_rgb, base_alpha) 时，
+    算法仍对整图推理（模型需要上下文），但**只在 roi_mask 内采用新结果**，
+    区域外保持 base 不变，并在 ROI 边界做窄带羽化，避免出现明显硬接缝。
+    用途：结果里某块没去干净时，框选该块单独重跑，而不用描边/点选逐个抠。
     """
     rgb_out, alpha_out, used_mode, rescued, reused, warnings = _process_core(
         rgb, origin_alpha, mode=mode, t_low=t_low, t_high=t_high,
@@ -108,7 +117,46 @@ def process_array(
         if n_keep or n_drop:
             warnings.append(
                 f"已叠加人工修改：保留 {n_keep} px、去除 {n_drop} px（优先于算法）")
+
+    # ROI 局部处理：只在框选区域内采用新结果（在裁决层叠加之后做，保证
+    # 区域外是"上一版最终结果"，区域内是"新算法 + 本次裁决"）
+    if roi_mask is not None and base_alpha is not None and base_rgb is not None \
+            and bool((roi_mask > 0).any()):
+        rgb_out, alpha_out = merge_roi(
+            base_rgb, base_alpha, rgb_out, alpha_out, roi_mask,
+            feather_px=roi_feather)
+        warnings.append(
+            f"ROI 局部处理：仅更新框选区域（{int((roi_mask > 0).sum())} px），区域外保持原结果")
     return rgb_out, alpha_out, used_mode, rescued, reused, warnings
+
+
+def merge_roi(
+    base_rgb: np.ndarray,
+    base_alpha: np.ndarray,
+    new_rgb: np.ndarray,
+    new_alpha: np.ndarray,
+    roi_mask: np.ndarray,
+    feather_px: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """ROI 局部替换：区域内用 (new_rgb, new_alpha)，区域外保持 (base_rgb, base_alpha)。
+
+    边界按 feather_px 做高斯羽化，在交界处对新旧结果做线性混合，
+    避免出现"框内框外"两套处理造成的明显硬接缝。
+    """
+    import cv2
+
+    m = (roi_mask > 0).astype(np.float32)
+    if feather_px > 0:
+        k = feather_px * 2 + 1
+        m = cv2.GaussianBlur(m, (k, k), 0)
+    m = np.clip(m, 0.0, 1.0)
+
+    m3 = m[:, :, None]
+    a = new_alpha.astype(np.float32) * m + base_alpha.astype(np.float32) * (1.0 - m)
+    rgb = (new_rgb.astype(np.float32) * m3
+           + base_rgb.astype(np.float32) * (1.0 - m3))
+    return (np.clip(rgb, 0.0, 255.0).astype(np.uint8),
+            np.clip(a, 0.0, 255.0).astype(np.uint8))
 
 
 def _process_core(
@@ -350,5 +398,5 @@ def process_batch(
 
 __all__ = [
     "ProcessResult", "process_array", "process_image", "process_batch",
-    "auto_feather_radius", "interactive",
+    "auto_feather_radius", "merge_roi", "interactive",
 ]

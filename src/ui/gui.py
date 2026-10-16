@@ -1,5 +1,5 @@
 """LucentCut 主窗口（M2 桌面 GUI + M5 AI + M7 交互式抠图 + M9 人工裁决层
-+ M12 精细抠图引擎 + M13 裁决语义修正与进度显示）。
++ M12 精细抠图引擎 + M13 裁决语义修正与进度显示 + M15 画布迁移/重写/ROI）。
 
 布局：
 - 左侧：文件列表 / 输入输出路径 / 参数面板 / 操作按钮
@@ -20,6 +20,13 @@ M9 关键设计（决策 D9/D10/D13；M13 修订 D13）
   提交/处理时按颜色直接生效，不受「作用」下拉当前值影响（M13 修正）。
 - 画布上未提交的涂抹，点「开始处理」时会自动并入裁决层（M13 新增）。
 - 撤销分三层：撤销草稿点 → 撤销已闭合区域 → 撤销上一次提交的修改。
+
+M15 新增（2026-10-16）
+----------------------
+- 画布迁移到 QGraphicsView/QGraphicsScene（视口裁剪，修复高倍缩放卡顿）；
+- **重写（Redo）**：撤销后可恢复（画布内 Ctrl+Y / 按钮；已提交的修改也可重写）；
+- **ROI 局部处理**：选「ROI 区域」工具框一块，点「开始处理」只更新该区域，
+  区域外保持上一次结果不变（适合"某块没去干净、又不想描边"的场景）。
 """
 
 from __future__ import annotations
@@ -107,6 +114,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # 撤销历史：(keep, drop, alpha, out_rgb)
         self._history: List[Tuple[Optional[np.ndarray], Optional[np.ndarray],
                                   Optional[np.ndarray], Optional[np.ndarray]]] = []
+        # 重写（redo）历史（M15）：存被 _undo() 弹出的快照，供 _redo() 恢复
+        self._redo_history: List[Tuple[Optional[np.ndarray], Optional[np.ndarray],
+                                       Optional[np.ndarray], Optional[np.ndarray]]] = []
+        # ROI 局部处理的底板（M15）：上次结果，作为"区域外保持不变"的依据
+        self._base_rgb: Optional[np.ndarray] = None
+        self._base_alpha: Optional[np.ndarray] = None
 
         # 处理计时（M13：左下角进度条 + 耗时）
         self._t0: Optional[float] = None
@@ -185,7 +198,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.erode = self._add_spin(pg, "收缩像素", 0, 0, 20, 3)
         self.denoise = self._add_spin(pg, "去噪最小面积", 0, 0, 10000, 4)
         self.ov_feather = self._add_spin(pg, "手动区边缘柔化", OVERRIDE_FEATHER, 0, 5, 5)
-        self.brush = self._add_spin(pg, "点选笔刷半径(px)", BRUSH_RADIUS, 2, 80, 6)
+        self.brush = self._add_spin(pg, "点选笔刷半径(px)", BRUSH_RADIUS, 1, 80, 6)
         tip = ("使用要点：下界↑=更多像素被判为背景（去得更狠）；\n"
                "上界↑=边缘过渡更宽更柔；两者之间就是半透明过渡带。\n"
                "笔刷半径=点选时一个圆点覆盖多少原图像素。\n"
@@ -258,13 +271,24 @@ class MainWindow(QtWidgets.QMainWindow):
         # 手动抠图工具栏：绘制方式
         draw_bar = QtWidgets.QHBoxLayout()
         draw_bar.addWidget(QtWidgets.QLabel("绘制："))
-        self.tool_none = QtWidgets.QPushButton("浏览")
+        self.tool_none = QtWidgets.QPushButton("预览")
+        self.tool_none.setToolTip(
+            "预览模式：不做任何绘制。\n"
+            "点击后会**清除画布上的 ROI 框与未提交的选区/涂抹**，"
+            "让画面回到干净的结果预览。")
         self.tool_rect = QtWidgets.QPushButton("矩形框")
         self.tool_points = QtWidgets.QPushButton("点选")
         self.tool_polygon = QtWidgets.QPushButton("描边")
         self.tool_lasso = QtWidgets.QPushButton("套索")
+        self.tool_roi = QtWidgets.QPushButton("ROI 区域")
+        self.tool_roi.setToolTip(
+            "框出一块**只处理这里**的区域（M15 新增）。\n"
+            "用法：选「ROI 区域」→ 在结果图上拖一个框 → 点「开始处理」。\n"
+            "只有框内会用当前引擎重新计算，框外保持上一次结果不变。\n"
+            "适合「某块背景没去干净，又不想一个个描边/点选」的场景。\n"
+            "点「清 ROI」可取消框选；ROI 与普通选区互不影响。")
         for b in (self.tool_none, self.tool_rect, self.tool_points,
-                  self.tool_polygon, self.tool_lasso):
+                  self.tool_polygon, self.tool_lasso, self.tool_roi):
             b.setCheckable(True)
             draw_bar.addWidget(b)
         self.tool_none.setChecked(True)
@@ -288,11 +312,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_btn = QtWidgets.QPushButton("✔ 应用选区 (Enter)")
         self.apply_btn.setToolTip("把当前画好的所有涂抹/区域一次性生效（可一次画多个区域）")
         self.undo_btn = QtWidgets.QPushButton("↶ 撤销 (Ctrl+Z)")
+        self.undo_btn.setToolTip("撤销：先退画布上未提交的笔迹，再退上一次已生效的修改")
+        self.redo_btn = QtWidgets.QPushButton("↷ 重写 (Ctrl+Y)")
+        self.redo_btn.setToolTip(
+            "重写（Redo）：恢复被「撤销」掉的内容。\n"
+            "比如刚撤销了一个点选，点这里可以把它恢复回来。\n"
+            "注意：撤销后若又画了新的内容，就重写不了了（标准撤销/重写语义）。")
         self.clear_sel_btn = QtWidgets.QPushButton("清空选区 (Esc)")
         self.clear_ov_btn = QtWidgets.QPushButton("清除手动修改")
+        self.clear_roi_btn = QtWidgets.QPushButton("清 ROI")
+        self.clear_roi_btn.setToolTip("清除已框选的 ROI 区域（不影响普通选区与已生效修改）")
         self.fit_btn = QtWidgets.QPushButton("适应窗口 (Ctrl+0)")
-        for b in (self.apply_btn, self.undo_btn, self.clear_sel_btn,
-                  self.clear_ov_btn, self.fit_btn):
+        for b in (self.apply_btn, self.undo_btn, self.redo_btn, self.clear_sel_btn,
+                  self.clear_ov_btn, self.clear_roi_btn, self.fit_btn):
             act_bar.addWidget(b)
         right.addLayout(act_bar)
 
@@ -344,11 +376,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tool_points.clicked.connect(lambda: self._set_tool("fg"))
         self.tool_polygon.clicked.connect(lambda: self._set_tool("polygon"))
         self.tool_lasso.clicked.connect(lambda: self._set_tool("lasso"))
+        self.tool_roi.clicked.connect(lambda: self._set_tool("roi"))
 
         self.apply_btn.clicked.connect(self._commit_selection)
         self.undo_btn.clicked.connect(self._undo)
+        self.redo_btn.clicked.connect(self._redo)
         self.clear_sel_btn.clicked.connect(self._clear_selection)
         self.clear_ov_btn.clicked.connect(self._clear_override)
+        self.clear_roi_btn.clicked.connect(self._clear_roi)
         self.fit_btn.clicked.connect(self._fit_all)
         self.grabcut_btn.clicked.connect(self._grabcut)
         self.show_ov.toggled.connect(self._on_show_override)
@@ -363,6 +398,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _install_shortcuts(self):
         QtGui.QShortcut(QtGui.QKeySequence.Undo, self, self._undo)
+        QtGui.QShortcut(QtGui.QKeySequence.Redo, self, self._redo)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Return), self,
                         self._commit_selection)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Enter), self,
@@ -412,9 +448,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._keep_mask = None
         self._drop_mask = None
         self._history = []
+        self._redo_history = []
+        self._base_rgb = None
+        self._base_alpha = None
         self.src_canvas.set_image(self._rgb, None, self._bg(), keep_transform=False)
         self.src_canvas.set_override_masks(None, None)
         self.dst_canvas.set_image(self._rgb, None, self._bg(), keep_transform=False)
+        self.dst_canvas.clear_roi()
         self._refresh_overlay()
         self.dst_canvas.clear_selection()
         self.dst_canvas.set_tool("none")
@@ -479,17 +519,35 @@ class MainWindow(QtWidgets.QMainWindow):
                     "本次将自动回退到 u2netp / 颜色键控（结果仍可用，"
                     "但复杂背景的头发与细轮廓会差一些）。\n\n"
                     "如需最好效果：运行 tools/download_models.py 下载 BiRefNet。")
+        # M15：ROI 局部处理——框选区域内重跑，区域外保持上一次结果。
+        # ROI 掩码由画布的 "roi" 工具产生；仅当用户确实框了区域才启用。
+        roi_mask = None
+        base_rgb = base_alpha = None
+        kw = self._kwargs()
+        if self.dst_canvas.has_roi():
+            roi_mask = interactive.regions_to_mask(
+                self._rgb.shape, self.dst_canvas.roi_regions())
+            if self._alpha is not None:
+                # 已有结果：以它为底板，区域外不变
+                base_rgb = self._out_rgb if self._out_rgb is not None else self._rgb
+                base_alpha = self._alpha
+            # 没有既有结果时（首次处理就框了 ROI），退化为整图处理，不设底板
         self._set_busy(True, "处理中…")
         self._override_dirty = False
         self._worker = Worker(self._run_process, self._rgb,
-                              self._origin_alpha, self._kwargs())
+                              self._origin_alpha, kw, roi_mask, base_rgb, base_alpha)
         self._worker.done.connect(self._on_done)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
 
-    def _run_process(self, rgb, orig_alpha, kwargs) -> dict:
+    def _run_process(self, rgb, orig_alpha, kwargs, roi_mask=None,
+                     base_rgb=None, base_alpha=None) -> dict:
         """在线程里执行，返回结果 dict。逻辑与 CLI/pipeline 完全一致。"""
         kw = dict(kwargs)
+        if roi_mask is not None:
+            kw["roi_mask"] = roi_mask
+            kw["base_rgb"] = base_rgb
+            kw["base_alpha"] = base_alpha
         # 人工裁决层不能带进批量/纯算法路径之外的比较，这里保留即可
         rgb_out, alpha, mode, rescued, reused, warnings = pipeline.process_array(
             rgb, orig_alpha, **kw)
@@ -500,6 +558,14 @@ class MainWindow(QtWidgets.QMainWindow):
         dt = self._set_busy(False)
         self._alpha = result["alpha"]
         self._out_rgb = result["rgb"]
+        # M15：记录本次结果，作为下次 ROI 局部处理的"区域外底板"
+        self._base_rgb = result["rgb"]
+        self._base_alpha = result["alpha"]
+        # M16：处理完成后清除画布上的 ROI 框 —— ROI 已在本次处理中被消费，
+        # 框继续留着会让用户以为"又要再处理一次"。
+        # （只清 ROI，不动选区：`_process` 开头已 take_selection 过，
+        #   这里若再清 selection 会误删"处理期间新画的未提交笔迹"。）
+        self.dst_canvas.clear_roi()
         self.dst_canvas.set_image(result["rgb"], result["alpha"], self._bg())
         self._refresh_overlay()
         self.save_btn.setEnabled(True)
@@ -632,13 +698,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_tool(self, tool: str):
         mapping = {"none": self.tool_none, "rect": self.tool_rect,
                    "fg": self.tool_points, "polygon": self.tool_polygon,
-                   "lasso": self.tool_lasso}
+                   "lasso": self.tool_lasso, "roi": self.tool_roi}
         for t, btn in mapping.items():
             btn.setChecked(t == tool)
         self.dst_canvas.set_tool(tool)
-        if tool != "none":
-            self.dst_canvas.setFocus()
-            self.status_label.setText(self._tool_hint(tool))
+        if tool == "none":
+            # M16：点「浏览」= 退出绘制并**清掉画布上所有绘制内容**
+            # （ROI 框 / 未提交的选区 / 涂抹点），让界面回到干净的结果预览。
+            self.dst_canvas.clear_roi()
+            self.dst_canvas.clear_selection()
+            self.status_label.setText("已切换到浏览：画布上的 ROI 框与选区已清除")
+            return
+        self.dst_canvas.setFocus()
+        self.status_label.setText(self._tool_hint(tool))
 
     def _tool_hint(self, tool: str) -> str:
         action = self.action_combo.currentData()
@@ -648,13 +720,21 @@ class MainWindow(QtWidgets.QMainWindow):
             "fg": f"按住左键涂「{what}」，右键涂反面（笔刷半径见左侧参数）",
             "polygon": "沿轮廓逐个点顶点，双击或右键闭合；可继续画下一个区域",
             "lasso": "按住左键沿轮廓画一圈，松开闭合；可继续画下一个区域",
+            "roi": "拖出一个矩形框出「只处理这里」的区域，再点「开始处理」（框外不变）",
         }.get(tool, "")
+        if tool == "roi":
+            return (f"{base}。ROI 与人工选区互不影响；点「清 ROI」取消框选。")
         return (f"{base}；作用={what} → 画完按 Enter 或点「应用选区」生效"
                 "（Esc 清空，Ctrl+Z 撤销）")
 
     def _clear_selection(self):
         self.dst_canvas.clear_selection()
         self.status_label.setText("已清空未提交的选区（已生效的修改不受影响）")
+
+    def _clear_roi(self):
+        """清除 ROI 框选（不影响普通选区与已生效的修改）。"""
+        self.dst_canvas.clear_roi()
+        self.status_label.setText("已清除 ROI 区域（下次「开始处理」将处理整张图）")
 
     def _commit_selection(self):
         if self.dst_canvas.tool() == "none":
@@ -830,20 +910,45 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.dst_canvas.tool() == "fg":
             self.status_label.setText(f"笔刷半径已设为 {int(v)} 像素")
 
-    def _push_history(self):
-        """提交前保存快照，供撤销回退。大图限制深度，避免吃内存。"""
-        if self._rgb is None:
-            return
-        area = self._rgb.shape[0] * self._rgb.shape[1]
-        limit = 3 if area > 8_000_000 else (6 if area > 2_000_000 else 12)
-        self._history.append((
+    def _snapshot_committed(self) -> tuple:
+        """当前已提交层面的状态快照 (keep, drop, alpha, out_rgb)。"""
+        return (
             None if self._keep_mask is None else self._keep_mask.copy(),
             None if self._drop_mask is None else self._drop_mask.copy(),
             None if self._alpha is None else self._alpha.copy(),
             None if self._out_rgb is None else self._out_rgb.copy(),
-        ))
+        )
+
+    def _push_history(self):
+        """提交前保存快照，供撤销回退。大图限制深度，避免吃内存。
+
+        新动作会让旧的"重写"记录失效（标准撤销/重写语义）。
+        """
+        if self._rgb is None:
+            return
+        if self._redo_history:
+            self._redo_history = []
+        area = self._rgb.shape[0] * self._rgb.shape[1]
+        limit = 3 if area > 8_000_000 else (6 if area > 2_000_000 else 12)
+        self._history.append(self._snapshot_committed())
         if len(self._history) > limit:
             self._history.pop(0)
+
+    def _apply_committed_snapshot(self, snap: tuple) -> None:
+        """把已提交层面的快照恢复到界面（用于撤销/重写）。"""
+        keep, drop, alpha, out_rgb = snap
+        self._keep_mask = keep
+        self._drop_mask = drop
+        self._alpha = alpha
+        self._out_rgb = out_rgb
+        if alpha is not None:
+            rgb = out_rgb if out_rgb is not None else self._rgb
+            self.dst_canvas.set_image(rgb, alpha, self._bg())
+            self.save_btn.setEnabled(True)
+        else:
+            self.dst_canvas.set_image(self._rgb, None, self._bg())
+            self.save_btn.setEnabled(False)
+        self._refresh_overlay()
 
     def _undo(self):
         """撤销：先退画布上的草稿/区域，再退上一次已提交的修改。
@@ -858,20 +963,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._history:
             self.status_label.setText("没有可撤销的操作")
             return
-        keep, drop, alpha, out_rgb = self._history.pop()
-        self._keep_mask = keep
-        self._drop_mask = drop
-        self._alpha = alpha
-        self._out_rgb = out_rgb
-        if alpha is not None:
-            rgb = out_rgb if out_rgb is not None else self._rgb
-            self.dst_canvas.set_image(rgb, alpha, self._bg())
-            self.save_btn.setEnabled(True)
-        else:
-            self.dst_canvas.set_image(self._rgb, None, self._bg())
-            self.save_btn.setEnabled(False)
-        self._refresh_overlay()
-        self.status_label.setText("已撤销上一步修改")
+        # 撤销前把"当前状态"压入重写栈，供 Ctrl+Y / 「重写」恢复
+        self._redo_history.append(self._snapshot_committed())
+        if len(self._redo_history) > 30:
+            self._redo_history.pop(0)
+        self._apply_committed_snapshot(self._history.pop())
+        self.status_label.setText("已撤销上一步修改（可按 Ctrl+Y 重写）")
+
+    def _redo(self):
+        """重写：恢复被撤销的内容。
+
+        先恢复画布内未提交的选区（笔迹级），再恢复上一次被撤销的已提交修改。
+        """
+        if self.dst_canvas.has_redo():
+            self.dst_canvas.redo()
+            self.status_label.setText("已重写画布上的选区笔迹")
+            return
+        if not self._redo_history:
+            self.status_label.setText("没有可重写的内容")
+            return
+        self._history.append(self._snapshot_committed())
+        self._apply_committed_snapshot(self._redo_history.pop())
+        self.status_label.setText("已重写上一次撤销的修改")
 
     def _clear_override(self):
         """清除全部人工裁决，回到纯算法结果。"""
